@@ -1,0 +1,16 @@
+﻿.venv/
+node_modules/
+**/node_modules/
+__pycache__/
+*.pyc
+.env
+*.gguf
+*.bin
+*.safetensors
+
+# runtime data / model caches — never commit these
+.hf-cache-local/
+data/
+models/
+*.db
+*.arrow
