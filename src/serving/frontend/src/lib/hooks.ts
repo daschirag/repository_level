@@ -16,7 +16,7 @@ export function useCountUp(target: number, durationMs = 1200): number {
     const start = performance.now();
     let frame = 0;
     const step = (now: number) => {
-      const t = Math.min(1, (now - start) / durationMs);
+      const t = Math.min(1, Math.max(0, (now - start) / durationMs));
       const eased = 1 - Math.pow(1 - t, 3);
       const next = from + (target - from) * eased;
       setValue(next);
