@@ -1,13 +1,17 @@
 """Layer 6: FastAPI backend for the tech-debt heatmap and refactor API.
 
 Serves Neo4j DIV graph data, top-debt rankings, RAG/graph context drill-down,
-and async StarCoder2 refactor proposal jobs.
+the latest analysis metadata, and async StarCoder2 refactor proposal jobs.
+
+The LLM is loaded once in a background thread at startup and shared by all
+jobs; proposals are cached per function until ``force`` is set.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,7 +22,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from neo4j import Driver, GraphDatabase
 from pydantic import BaseModel, Field
 
-from src.agent.refactor_agent import generate_refactor_proposals
+from src.agent import rules
+from src.agent.refactor_agent import (
+    generate_refactor_proposals,
+    get_shared_llm_client,
+    llm_label,
+)
 from src.agent.tools import (
     NEO4J_PASSWORD,
     NEO4J_URI,
@@ -33,6 +42,25 @@ logger = logging.getLogger(__name__)
 # In-memory async job store (single-process demo; not durable across restarts).
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+# node id -> job id of the latest *completed* proposal (per-function cache).
+_proposal_cache: dict[str, str] = {}
+
+# Ordered agent stages reported to the UI (generate_2 only runs on a retry).
+JOB_STAGES = [
+    "queued",
+    "waiting_for_model",
+    "load_span",
+    "gather_context",
+    "gather_source",
+    "generate_1",
+    "generate_2",
+    "rules",
+    "done",
+]
+
+# LLM loaded once at startup in a background thread.
+_llm_state: dict[str, Any] = {"status": "not_loaded", "model": None, "error": None, "load_s": None}
+_llm_ready = threading.Event()
 
 # Shared clients, initialized in lifespan.
 _neo4j_driver: Optional[Driver] = None
@@ -46,10 +74,31 @@ class RefactorRequest(BaseModel):
     # Optional single-function target; when both are set, ``top_k`` is ignored.
     file_path: Optional[str] = None
     name: Optional[str] = None
+    # Bypass the per-function cache and generate a fresh proposal.
+    force: bool = False
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_llm() -> None:
+    """Background loader: warm the shared LLM so jobs never pay the load cost."""
+    _llm_state["status"] = "loading"
+    t0 = time.perf_counter()
+    try:
+        client = get_shared_llm_client()
+        _llm_state.update(
+            status="ready",
+            model=llm_label(client),
+            load_s=round(time.perf_counter() - t0, 1),
+        )
+        logger.info("LLM ready: %s (%.1fs)", _llm_state["model"], _llm_state["load_s"])
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("LLM failed to load")
+        _llm_state.update(status="failed", error=str(exc))
+    finally:
+        _llm_ready.set()
 
 
 @asynccontextmanager
@@ -58,7 +107,10 @@ async def lifespan(app: FastAPI):
     global _neo4j_driver, _rag_client
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    # Neo4j server notifications (e.g. "null value eliminated") are not errors.
+    logging.getLogger("neo4j").setLevel(logging.ERROR)
     logger.info("Starting techdebt API (Neo4j=%s)", NEO4J_URI)
+    threading.Thread(target=_load_llm, name="llm-loader", daemon=True).start()
 
     _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
@@ -130,8 +182,40 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "neo4j": neo4j_ok,
         "qdrant": qdrant_ok,
+        "llm": dict(_llm_state),
         "jobs_tracked": len(_jobs),
     }
+
+
+@app.get("/api/analysis")
+def analysis() -> dict[str, Any]:
+    """Metadata for the analysed repo plus live graph counts for the pipeline story.
+
+    ``meta`` comes from the ``(:Analysis {id:'latest'})`` node written by
+    ``scripts/load_demo.py`` (``null`` if the graph was loaded another way).
+    """
+    driver = _require_driver()
+    with driver.session() as session:
+        meta = session.run("MATCH (a:Analysis {id: 'latest'}) RETURN properties(a) AS p").single()
+        counts = session.run(
+            """
+            CALL () { MATCH (f:File) RETURN count(f) AS files }
+            CALL () { MATCH (f:Function) RETURN count(f) AS functions,
+                        count(CASE WHEN f.div_score > 0 THEN 1 END) AS scored,
+                        max(f.div_score) AS max_div,
+                        avg(coalesce(f.div_score, 0)) AS avg_div,
+                        sum(coalesce(f.end_line - f.start_line + 1, 0)) AS loc }
+            CALL () { MATCH (c:Class) RETURN count(c) AS classes }
+            CALL () { MATCH (m:Module) RETURN count(m) AS modules }
+            CALL () { MATCH (:Function)-[r:CALLS]->(:Function) RETURN count(r) AS calls }
+            CALL () { MATCH ()-[r:IMPORTS]->() RETURN count(r) AS imports }
+            CALL () { MATCH (f:Function) WHERE (f)<-[:CALLS]-() OR (f)-[:CALLS]->()
+                      RETURN count(f) AS connected }
+            RETURN files, functions, scored, max_div, avg_div, loc, classes, modules,
+                   calls, imports, connected
+            """
+        ).single()
+    return {"meta": meta["p"] if meta else None, "counts": dict(counts) if counts else {}}
 
 
 @app.get("/api/debt-graph")
@@ -287,9 +371,19 @@ def function_context_query(
     file_path: str = Query(..., description="Repository-relative file path"),
     name: str = Query(..., description="Function name"),
 ) -> dict[str, Any]:
-    """Same as the path-param route, but with query params (slash-safe)."""
+    """Same as the path-param route, but with query params (slash-safe).
+
+    Adds ``impact`` (transitive callers / affected files from the call graph)
+    and deterministic ``rule_based`` suggestions so the drawer can explain the
+    debt without waiting for the LLM.
+    """
     try:
-        return fetch_function_context(file_path.replace("\\", "/"), name)
+        file_path = file_path.replace("\\", "/")
+        ctx = fetch_function_context(file_path, name)
+        metrics = rules.fetch_node_metrics(_require_driver(), file_path, name)
+        ctx["impact"] = dict(metrics) if metrics else None
+        ctx["rule_based"] = rules.suggest(metrics) if metrics else []
+        return ctx
     except Exception as exc:  # noqa: BLE001
         logger.exception("context lookup failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -313,19 +407,43 @@ def _fetch_debt_node(driver: Driver, file_path: str, name: str) -> Optional[dict
     return dict(record) if record else None
 
 
+def _set_stage(job_id: str, stage: str) -> None:
+    with _jobs_lock:
+        job = _jobs[job_id]
+        job["stage"] = stage
+        if stage not in job["stages_seen"]:
+            job["stages_seen"].append(stage)
+
+
 def _run_refactor_job(
-    job_id: str, top_k: int, nodes: Optional[list[dict[str, Any]]] = None
+    job_id: str,
+    top_k: int,
+    nodes: Optional[list[dict[str, Any]]] = None,
+    cache_key: Optional[str] = None,
 ) -> None:
-    """Background worker: generate proposals and update job status."""
+    """Background worker: generate proposals and update job status/stage."""
     with _jobs_lock:
         _jobs[job_id]["status"] = "running"
         _jobs[job_id]["started_at"] = _utc_now()
     try:
-        proposals = generate_refactor_proposals(top_k=top_k, nodes=nodes)
+        if not _llm_ready.is_set():
+            _set_stage(job_id, "waiting_for_model")
+            _llm_ready.wait()
+        if _llm_state["status"] == "failed":
+            raise RuntimeError(f"LLM failed to load: {_llm_state['error']}")
+        proposals = generate_refactor_proposals(
+            top_k=top_k,
+            llm=get_shared_llm_client(),
+            nodes=nodes,
+            on_progress=lambda stage: _set_stage(job_id, stage),
+        )
+        _set_stage(job_id, "done")
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
             _jobs[job_id]["finished_at"] = _utc_now()
             _jobs[job_id]["result"] = {"top_k": top_k, "proposals": proposals}
+            if cache_key:
+                _proposal_cache[cache_key] = job_id
     except Exception as exc:  # noqa: BLE001
         logger.exception("Refactor job %s failed", job_id)
         with _jobs_lock:
@@ -342,10 +460,17 @@ def start_refactor_proposals(
     """Enqueue a StarCoder2 refactor job; poll with GET ``/api/refactor-proposals/{job_id}``.
 
     Targets the top-``k`` DIV functions, or a single function when ``file_path``
-    and ``name`` are both given.
+    and ``name`` are both given. Single-function results are cached: the
+    latest completed job is returned (``cached: true``) unless ``force``.
     """
     nodes: Optional[list[dict[str, Any]]] = None
+    cache_key: Optional[str] = None
     if body.file_path and body.name:
+        cache_key = _node_id(body.file_path.replace("\\", "/"), body.name)
+        with _jobs_lock:
+            cached_id = _proposal_cache.get(cache_key)
+            if cached_id and not body.force:
+                return {"job_id": cached_id, "status": "completed", "top_k": 1, "cached": True}
         node = _fetch_debt_node(_require_driver(), body.file_path.replace("\\", "/"), body.name)
         if node is None:
             raise HTTPException(
@@ -358,15 +483,20 @@ def start_refactor_proposals(
         _jobs[job_id] = {
             "job_id": job_id,
             "status": "queued",
-            "top_k": body.top_k,
+            "top_k": 1 if nodes is not None else body.top_k,
             "created_at": _utc_now(),
             "started_at": None,
             "finished_at": None,
             "result": None,
             "error": None,
+            "stage": "queued",
+            "stages_seen": ["queued"],
+            "stage_order": JOB_STAGES,
+            "target": cache_key,
         }
-    background_tasks.add_task(_run_refactor_job, job_id, body.top_k, nodes)
-    return {"job_id": job_id, "status": "queued", "top_k": body.top_k}
+    background_tasks.add_task(_run_refactor_job, job_id, body.top_k, nodes, cache_key)
+    top_k = 1 if nodes is not None else body.top_k
+    return {"job_id": job_id, "status": "queued", "top_k": top_k, "cached": False}
 
 
 @app.get("/api/refactor-proposals/{job_id}")

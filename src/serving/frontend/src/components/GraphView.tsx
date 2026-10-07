@@ -2,10 +2,18 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import type { DebtEdge, DebtNode } from "../api";
+import type { BlastRadius } from "../lib/analysis";
 import { DIV_STOPS, formatDiv } from "../lib/scales";
 
 type SimNode = DebtNode & d3.SimulationNodeDatum & { r: number };
 type SimLink = d3.SimulationLinkDatum<SimNode> & { type: string };
+
+/**
+ * Reveal phase driven by the story stepper:
+ * 0 = empty, 1 = nodes appear (neutral), 2 = call edges draw in,
+ * 3 = colours flood in by DIV (the finished heat-map).
+ */
+export type GraphPhase = 0 | 1 | 2 | 3;
 
 type Props = {
   /** Function nodes only. */
@@ -17,18 +25,38 @@ type Props = {
   radiusOf: (div: number) => number;
   selectedId: string | null;
   onSelect: (node: DebtNode) => void;
+  phase: GraphPhase;
+  /** Bumped to rebuild and replay the reveal from phase 0. */
+  replayKey: number;
+  /** Transitive callers of the selected node (highlighted as a ripple). */
+  blast: BlastRadius | null;
+  /** Node to ring during the "Prioritise" story step. */
+  spotlightId: string | null;
 };
 
 type Tooltip = { node: DebtNode; x: number; y: number };
 
 const LIMIT_OPTIONS = [50, 100, 250, 0] as const; // 0 = all
 const ARROW_PAD = 3;
+const NEUTRAL_FILL = "#5b6880";
 
 function truncate(text: string, max: number) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId, onSelect }: Props) {
+export function GraphView({
+  nodes,
+  edges,
+  maxDiv,
+  colorOf,
+  radiusOf,
+  selectedId,
+  onSelect,
+  phase,
+  replayKey,
+  blast,
+  spotlightId,
+}: Props) {
   const reduceMotion = useReducedMotion() ?? false;
   const uid = useId().replace(/:/g, "");
   const containerRef = useRef<HTMLDivElement>(null);
@@ -42,6 +70,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
   // D3 handles shared between the build effect and the emphasis/zoom effects.
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const fitRef = useRef<() => void>(() => {});
+  const advanceRef = useRef<(target: GraphPhase) => void>(() => {});
   const nodeSelRef = useRef<d3.Selection<SVGGElement, SimNode, SVGGElement, unknown> | null>(null);
   const linkSelRef = useRef<d3.Selection<SVGPathElement, SimLink, SVGGElement, unknown> | null>(null);
   const neighborsRef = useRef<Map<string, Set<string>>>(new Map());
@@ -49,6 +78,10 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
   const hoverIdRef = useRef<string | null>(null);
   const matchesRef = useRef<Set<string> | null>(null);
   const selectedIdRef = useRef<string | null>(selectedId);
+  const blastRef = useRef<BlastRadius | null>(blast);
+  const spotlightRef = useRef<string | null>(spotlightId);
+  const phaseRef = useRef<GraphPhase>(phase);
+  const edgesShownRef = useRef(false);
   const selfSelectRef = useRef(false);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
@@ -72,7 +105,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       .slice(0, 8);
   }, [query, visible.nodes]);
 
-  /** Apply hover > search > none emphasis, plus the persistent selection ring. */
+  /** Emphasis precedence: hover > search > blast radius; plus selection/spotlight rings. */
   const applyEmphasis = useRef(() => {});
   applyEmphasis.current = () => {
     const nodeSel = nodeSelRef.current;
@@ -80,28 +113,61 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
     if (!nodeSel || !linkSel) return;
     const hover = hoverIdRef.current;
     const found = matchesRef.current;
+    const radius = !hover && !found ? blastRef.current : null;
+    const inBlast = (id: string) => !!radius && (id === radius.rootId || radius.depth.has(id));
     const keep = hover ? new Set([hover, ...(neighborsRef.current.get(hover) ?? [])]) : found;
 
     nodeSel
-      .classed("is-dim", (d) => (keep ? !keep.has(d.id) : false))
+      .classed("is-dim", (d) => (keep ? !keep.has(d.id) : radius ? !inBlast(d.id) : false))
       .classed("is-match", (d) => !hover && !!found?.has(d.id))
-      .classed("is-selected", (d) => d.id === selectedIdRef.current);
+      .classed("is-selected", (d) => d.id === selectedIdRef.current)
+      .classed("is-spotlight", (d) => d.id === spotlightRef.current)
+      .classed("is-blast", (d) => !!radius && radius.depth.has(d.id))
+      .style("--ripple-delay", (d) => (radius?.depth.has(d.id) ? `${(radius.depth.get(d.id)! - 1) * 0.18}s` : null));
 
+    const showArrows = edgesShownRef.current;
     linkSel.each(function (d) {
       const s = (d.source as SimNode).id;
       const t = (d.target as SimNode).id;
       const out = !!hover && s === hover;
       const inc = !!hover && t === hover;
-      const dim = hover ? !out && !inc : !!found;
+      const blastLink = !!radius && inBlast(s) && inBlast(t);
+      const dim = hover ? !out && !inc : found ? true : radius ? !blastLink : false;
       d3.select(this)
         .classed("is-out", out)
         .classed("is-in", inc)
+        .classed("is-blast", blastLink)
         .classed("is-dim", dim)
-        .attr("marker-end", `url(#${uid}-arrow${out ? "-out" : inc ? "-in" : ""})`);
+        .attr(
+          "marker-end",
+          showArrows ? `url(#${uid}-arrow${out ? "-out" : inc ? "-in" : blastLink ? "-blast" : ""})` : null,
+        );
     });
+
+    // "N affected" badge on the blast root.
+    nodeSel.selectAll(".blast-badge").remove();
+    if (radius && phaseRef.current >= 3) {
+      nodeSel
+        .filter((d) => d.id === radius.rootId)
+        .each(function (d) {
+          const badge = d3
+            .select(this)
+            .append("g")
+            .attr("class", "blast-badge")
+            .attr("transform", `translate(0,${-(d.r + 20)})`);
+          const rect = badge.append("rect").attr("rx", 9).attr("height", 18).attr("y", -9);
+          const text = badge
+            .append("text")
+            .attr("dy", "0.35em")
+            .text(`${radius.functions} affected`);
+          const w = (text.node() as SVGTextElement).getComputedTextLength() + 16;
+          rect.attr("width", w).attr("x", -w / 2);
+          text.attr("text-anchor", "middle");
+        });
+    }
   };
 
-  // ---- Build the force graph whenever the visible data changes. ----
+  // ---- Build the force graph whenever the visible data changes (or on replay). ----
   useEffect(() => {
     const svgEl = svgRef.current;
     const container = containerRef.current;
@@ -112,8 +178,9 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
     const svg = d3.select(svgEl);
     svg.selectAll("*").remove();
     svg.attr("viewBox", `0 0 ${width} ${height}`);
+    edgesShownRef.current = false;
 
-    // Defs: glow filter + three arrowheads (default / outgoing / incoming).
+    // Defs: glow filter + arrowheads (default / outgoing / incoming / blast).
     const defs = svg.append("defs");
     const glow = defs
       .append("filter")
@@ -122,7 +189,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       .attr("y", "-100%")
       .attr("width", "300%")
       .attr("height", "300%");
-    glow.append("feGaussianBlur").attr("stdDeviation", 5).attr("result", "blur");
+    glow.append("feGaussianBlur").attr("stdDeviation", 6).attr("result", "blur");
     const merge = glow.append("feMerge");
     merge.append("feMergeNode").attr("in", "blur");
     merge.append("feMergeNode").attr("in", "SourceGraphic");
@@ -130,6 +197,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       ["", "arrow"],
       ["-out", "arrow arrow--out"],
       ["-in", "arrow arrow--in"],
+      ["-blast", "arrow arrow--blast"],
     ] as const) {
       defs
         .append("marker")
@@ -206,7 +274,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       .data(simLinks)
       .join("path")
       .attr("class", "link")
-      .attr("marker-end", `url(#${uid}-arrow)`);
+      .style("opacity", 0);
 
     const node = root
       .append("g")
@@ -214,14 +282,19 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       .selectAll<SVGGElement, SimNode>("g")
       .data(simNodes, (d) => d.id)
       .join("g")
-      .attr("class", "node")
+      .attr("class", (d) => `node${hot.has(d.id) ? " is-hot" : ""}`)
       .attr("tabindex", 0)
       .attr("role", "button")
       .attr(
         "aria-label",
         (d) => `${d.name} in ${d.file_path}, DIV ${formatDiv(d.div_score)}. Press Enter for details.`,
-      );
+      )
+      .style("opacity", 0);
 
+    node
+      .append("circle")
+      .attr("class", "node__ripple")
+      .attr("r", (d) => d.r + 3);
     node
       .append("circle")
       .attr("class", "node__halo")
@@ -229,8 +302,8 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
     const circle = node
       .append("circle")
       .attr("class", "node__body")
-      .attr("fill", (d) => colorOf(d.div_score))
-      .attr("filter", (d) => (hot.has(d.id) ? `url(#${uid}-glow)` : null));
+      .attr("r", 0)
+      .attr("fill", NEUTRAL_FILL);
     node
       .filter((d) => labelled.has(d.id))
       .append("text")
@@ -241,39 +314,82 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
     nodeSelRef.current = node;
     linkSelRef.current = link;
 
-    // Entry animation: nodes scale/fade in, edges draw in, arrowheads last.
-    if (reduceMotion) {
-      circle.attr("r", (d) => d.r);
-    } else {
-      node.style("opacity", 0);
-      circle.attr("r", 0);
-      const stagger = Math.min(14, 700 / Math.max(1, simNodes.length));
-      node
-        .transition()
-        .delay((_, i) => i * stagger)
-        .duration(450)
-        .style("opacity", 1);
-      circle
-        .transition()
-        .delay((_, i) => i * stagger)
-        .duration(650)
-        .ease(d3.easeBackOut.overshoot(1.6))
-        .attr("r", (d) => d.r);
-      link
-        .attr("pathLength", 1)
-        .attr("stroke-dasharray", 1)
-        .attr("stroke-dashoffset", 1)
-        .attr("marker-end", null)
-        .transition()
-        .delay(350)
-        .duration(900)
-        .ease(d3.easeCubicOut)
-        .attr("stroke-dashoffset", 0)
-        .on("end", function () {
-          d3.select(this).attr("stroke-dasharray", null).attr("pathLength", null);
-          applyEmphasis.current();
-        });
-    }
+    // ---- Phase-driven reveal ----
+    let applied: GraphPhase = 0;
+    const showEdgesNow = () => {
+      edgesShownRef.current = true;
+      applyEmphasis.current();
+    };
+    const advanceTo = (target: GraphPhase) => {
+      if (target <= applied) return;
+      if (reduceMotion) {
+        if (target >= 1) {
+          node.style("opacity", 1);
+          circle.attr("r", (d) => d.r);
+        }
+        if (target >= 2) {
+          link.style("opacity", 1);
+          showEdgesNow();
+        }
+        if (target >= 3) {
+          circle
+            .attr("fill", (d) => colorOf(d.div_score))
+            .attr("filter", (d) => (hot.has(d.id) ? `url(#${uid}-glow)` : null));
+        }
+        applied = target;
+        applyEmphasis.current();
+        return;
+      }
+
+      let offset = 0;
+      if (target >= 1 && applied < 1) {
+        const stagger = Math.min(12, 700 / Math.max(1, simNodes.length));
+        node
+          .transition("appear")
+          .delay((_, i) => i * stagger)
+          .duration(450)
+          .style("opacity", 1);
+        circle
+          .transition("grow")
+          .delay((_, i) => i * stagger)
+          .duration(600)
+          .ease(d3.easeBackOut.overshoot(1.6))
+          .attr("r", (d) => d.r);
+        offset += 700;
+      }
+      if (target >= 2 && applied < 2) {
+        link
+          .style("opacity", 1)
+          .attr("pathLength", 1)
+          .attr("stroke-dasharray", 1)
+          .attr("stroke-dashoffset", 1)
+          .transition("draw")
+          .delay((_, i) => offset + Math.min(i * 6, 500))
+          .duration(800)
+          .ease(d3.easeCubicOut)
+          .attr("stroke-dashoffset", 0)
+          .on("end", function () {
+            d3.select(this).attr("stroke-dasharray", null).attr("pathLength", null);
+          });
+        // Arrowheads once the lines have (mostly) drawn.
+        window.setTimeout(showEdgesNow, offset + 700);
+        offset += 900;
+      }
+      if (target >= 3 && applied < 3) {
+        // Flood: hottest nodes light up first.
+        circle
+          .transition("flood")
+          .delay((d) => offset + (1 - (maxDiv > 0 ? d.div_score / maxDiv : 0)) * 900)
+          .duration(550)
+          .attr("fill", (d) => colorOf(d.div_score))
+          .on("end", function (d) {
+            if (hot.has(d.id)) d3.select(this).attr("filter", `url(#${uid}-glow)`);
+          });
+        window.setTimeout(() => applyEmphasis.current(), offset + 1500);
+      }
+      applied = target;
+    };
+    advanceRef.current = advanceTo;
 
     const ticked = () => {
       link.attr("d", (d) => {
@@ -335,6 +451,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       ticked();
       fit(false);
       fitted = true;
+      sim.on("tick", ticked);
     } else {
       sim.on("tick", () => {
         ticked();
@@ -404,8 +521,8 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
           d.fy = null;
         }),
     );
-    if (reduceMotion) sim.on("tick", ticked);
 
+    advanceTo(phaseRef.current);
     applyEmphasis.current();
 
     const resize = new ResizeObserver(() => {
@@ -433,13 +550,28 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       resize.disconnect();
       sim.stop();
       svg.interrupt();
+      node.interrupt("appear");
+      circle.interrupt("grow").interrupt("flood");
+      link.interrupt("draw");
       nodeSelRef.current = null;
       linkSelRef.current = null;
     };
-  }, [visible, colorOf, radiusOf, reduceMotion, uid]);
+  }, [visible, colorOf, radiusOf, reduceMotion, uid, maxDiv, replayKey]);
 
+  // Story phase changes.
+  useEffect(() => {
+    phaseRef.current = phase;
+    advanceRef.current(phase);
+  }, [phase]);
 
-  // Selection ring; pan to nodes selected from outside the graph (list, search).
+  // Blast radius / spotlight changes.
+  useEffect(() => {
+    blastRef.current = blast;
+    spotlightRef.current = spotlightId;
+    applyEmphasis.current();
+  }, [blast, spotlightId]);
+
+  // Selection ring; pan to nodes selected from outside the graph (list, search, story).
   useEffect(() => {
     selectedIdRef.current = selectedId;
     applyEmphasis.current();
@@ -475,6 +607,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
 
   const listId = `${uid}-matches`;
   const hiddenCount = nodes.length - visible.nodes.length;
+  const blastHidden = blast ? [...blast.depth.keys()].filter((id) => !simNodesRef.current.has(id)).length : 0;
 
   return (
     <div className="graph">
@@ -589,6 +722,11 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
 
       <div className="graph__canvas" ref={containerRef}>
         <svg ref={svgRef} className="graph__svg" role="group" aria-label="Call graph heat-map" />
+        {blast && blastHidden > 0 && (
+          <p className="graph__note">
+            {blastHidden} of {blast.functions} affected functions are outside the current view — choose “All” to see them.
+          </p>
+        )}
         <AnimatePresence>
           {tooltip && (
             <motion.div
@@ -615,12 +753,11 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
                 <dt>Complexity</dt>
                 <dd className="mono">{tooltip.node.cyclomatic_complexity}</dd>
                 <dt>Churn</dt>
-                <dd className="mono">{tooltip.node.change_frequency} commits</dd>
+                <dd className="mono">{tooltip.node.change_frequency} commits to file</dd>
               </dl>
             </motion.div>
           )}
         </AnimatePresence>
-
       </div>
 
       <div className="legend" aria-label="Legend">
@@ -661,6 +798,10 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
           <li>
             <span className="legend__line" style={{ background: "var(--caller)" }} aria-hidden="true" />
             Callers on hover
+          </li>
+          <li>
+            <span className="legend__ripple" aria-hidden="true" />
+            Blast radius of selection
           </li>
         </ul>
         {maxDiv === 0 && (

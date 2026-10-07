@@ -3,14 +3,15 @@ import { useCountUp } from "../lib/hooks";
 import { Skeleton } from "./ui";
 
 export type Stats = {
-  nodeCount: number;
-  edgeCount: number;
-  functionCount: number;
-  callCount: number;
-  importCount: number;
+  functions: number;
+  files: number;
+  calls: number;
+  imports: number;
+  connected: number;
   maxDiv: number;
   maxDivName: string | null;
   avgDiv: number;
+  scored: number;
 };
 
 type CardProps = {
@@ -63,21 +64,21 @@ export function StatCards({ stats }: { stats: Stats | null }) {
     <section className="stats" aria-label="Summary">
       <StatCard
         index={0}
-        label="Total nodes"
-        value={stats.nodeCount}
-        hint={`${stats.functionCount.toLocaleString()} functions`}
+        label="Functions analysed"
+        value={stats.functions}
+        hint={`across ${stats.files.toLocaleString()} files`}
       />
       <StatCard
         index={1}
-        label="Edges"
-        value={stats.edgeCount}
-        hint={`${stats.callCount.toLocaleString()} calls · ${stats.importCount.toLocaleString()} imports`}
+        label="Call edges"
+        value={stats.calls}
+        hint={`${stats.connected.toLocaleString()} functions connected · ${stats.imports.toLocaleString()} imports`}
       />
       <StatCard
         index={2}
         label="Highest DIV"
         value={stats.maxDiv}
-        decimals={2}
+        decimals={1}
         hint={stats.maxDivName ?? "—"}
         accent
       />
@@ -85,8 +86,8 @@ export function StatCards({ stats }: { stats: Stats | null }) {
         index={3}
         label="Average DIV"
         value={stats.avgDiv}
-        decimals={3}
-        hint={`across ${stats.functionCount.toLocaleString()} functions`}
+        decimals={2}
+        hint={`${stats.scored.toLocaleString()} of ${stats.functions.toLocaleString()} functions carry debt`}
       />
     </section>
   );

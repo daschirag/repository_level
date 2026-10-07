@@ -29,11 +29,80 @@ export type TopDebtNode = Pick<
   "id" | "file_path" | "name" | "div_score" | "cyclomatic_complexity" | "change_frequency"
 >;
 
+export type LlmState = {
+  status: "not_loaded" | "loading" | "ready" | "failed";
+  model: string | null;
+  error: string | null;
+  load_s: number | null;
+};
+
 export type HealthResponse = {
   status: string;
   neo4j: boolean;
   qdrant: boolean;
+  llm?: LlmState;
   jobs_tracked: number;
+};
+
+/** Written by scripts/load_demo.py as (:Analysis {id:'latest'}). */
+export type AnalysisMeta = {
+  repo_name: string;
+  repo_url: string;
+  commit: string;
+  commit_date: string;
+  commit_subject: string;
+  source_path: string;
+  scope: string;
+  fixture_verified: boolean;
+  commits_in_history: number;
+  files_with_churn: number;
+  call_sites: number;
+  unresolved_calls: number;
+  rag_embedded: number;
+  rag_considered: number;
+  analysed_at: string;
+  duration_s: number;
+  t_history_s?: number;
+  t_parse_s?: number;
+  t_graph_s?: number;
+  t_scoring_s?: number;
+  t_embeddings_s?: number;
+};
+
+export type AnalysisCounts = {
+  files: number;
+  functions: number;
+  scored: number;
+  max_div: number | null;
+  avg_div: number | null;
+  loc: number;
+  classes: number;
+  modules: number;
+  calls: number;
+  imports: number;
+  connected: number;
+};
+
+export type AnalysisResponse = {
+  meta: AnalysisMeta | null;
+  counts: AnalysisCounts;
+};
+
+export type RuleSuggestion = {
+  rule: string;
+  title: string;
+  detail: string;
+};
+
+export type ImpactMetrics = {
+  cyclomatic_complexity: number;
+  loc: number;
+  change_frequency: number;
+  direct_callers: number;
+  direct_callees: number;
+  transitive_callers: number;
+  affected_files: number;
+  churn_threshold: number;
 };
 
 /** 1-hop CALLS neighbour returned by the context endpoint. */
@@ -68,19 +137,46 @@ export type FunctionContext = {
   callers?: CallNeighbor[];
   callees?: CallNeighbor[];
   semantic_neighbors?: SemanticNeighbor[];
+  impact?: ImpactMetrics | null;
+  rule_based?: RuleSuggestion[];
+};
+
+export type ProposalAttempt = {
+  attempt: number;
+  prompt_style: string;
+  valid: boolean;
+  reasons: string[];
 };
 
 export type RefactorProposal = {
   file_path: string;
   name: string;
   div_score: number;
+  /** "ai" only when model output passed validation. */
+  source: "ai" | "rule_based";
+  model: string;
+  valid: boolean;
+  attempts: ProposalAttempt[];
   refactor_type: string | null;
   proposal_text: string | null;
   rationale: string | null;
   raw_llm_output?: string | null;
+  source_error?: string | null;
+  rule_based: RuleSuggestion[];
 };
 
 export type RefactorJobStatus = "queued" | "running" | "completed" | "failed";
+
+export type JobStage =
+  | "queued"
+  | "waiting_for_model"
+  | "load_span"
+  | "gather_context"
+  | "gather_source"
+  | "generate_1"
+  | "generate_2"
+  | "rules"
+  | "done";
 
 export type RefactorJob = {
   job_id: string;
@@ -91,6 +187,9 @@ export type RefactorJob = {
   finished_at: string | null;
   result: { top_k: number; proposals: RefactorProposal[] } | null;
   error: string | null;
+  stage: JobStage;
+  stages_seen: JobStage[];
+  stage_order: JobStage[];
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
@@ -106,6 +205,10 @@ async function getJson<T>(path: string): Promise<T> {
 
 export function fetchHealth(): Promise<HealthResponse> {
   return getJson("/api/health");
+}
+
+export function fetchAnalysis(): Promise<AnalysisResponse> {
+  return getJson("/api/analysis");
 }
 
 export function fetchDebtGraph(): Promise<DebtGraphResponse> {
@@ -124,15 +227,18 @@ export function fetchFunctionContext(
   return getJson(`/api/function/context?${qs.toString()}`);
 }
 
-/** Enqueue a refactor job for one function (``file_path`` + ``name``). */
-export async function startRefactorJob(target: {
-  file_path: string;
-  name: string;
-}): Promise<{ job_id: string; status: RefactorJobStatus }> {
+/**
+ * Enqueue a refactor job for one function (``file_path`` + ``name``). The API
+ * returns the cached job (``cached: true``) unless ``force`` is set.
+ */
+export async function startRefactorJob(
+  target: { file_path: string; name: string },
+  force = false,
+): Promise<{ job_id: string; status: RefactorJobStatus; cached: boolean }> {
   const res = await fetch(`${API_BASE}/api/refactor-proposals`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ top_k: 1, ...target }),
+    body: JSON.stringify({ top_k: 1, force, ...target }),
   });
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);

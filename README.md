@@ -18,6 +18,29 @@ From the project root (uses `docker-compose.yml`; waits until both report health
 docker compose up -d --wait
 ```
 
+## Load the demo repository (one command)
+
+With Neo4j + Qdrant running, from the project root:
+
+```bash
+python scripts/load_demo.py            # library code (src/) only — the dashboard default
+python scripts/load_demo.py --include-tests   # also analyse tests/, examples/, docs/
+python scripts/load_demo.py --skip-qdrant     # skip the embedding step
+```
+
+What it does (~30 s after the first run):
+
+1. Clones `pallets/flask` with full history into `data/demo/flask` (~13 MB, gitignored) and checks out
+   `36e4a824`, the exact commit `tests/fixtures/flask-test-repo` was copied from. The fixture has no
+   `.git` of its own, so the clone supplies real commit history for churn.
+2. Verifies the fixture is byte-identical to that commit (git blob ids).
+3. Parses the fixture, computes radon complexity, rebuilds the Neo4j call graph, propagates DIV,
+   and re-indexes Qdrant.
+4. Records repo, commit, counts and per-stage timings on an `(:Analysis {id:'latest'})` node,
+   which the dashboard header and pipeline stepper read via `GET /api/analysis`.
+
+The loader **replaces** whatever graph and Qdrant collection were loaded before.
+
 ## Layer 6 — API + heatmap UI
 
 ### Backend (FastAPI)
@@ -36,12 +59,20 @@ Key routes:
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/health` | Neo4j / Qdrant / LLM status (`llm.status`: loading → ready) |
+| GET | `/api/analysis` | Last-analysis metadata + live graph counts |
 | GET | `/api/debt-graph` | Nodes + CALLS/IMPORTS edges for D3 |
-| GET | `/api/top-debt?k=10` | Top-k DIV functions |
-| GET | `/api/function/context?file_path=...&name=...` | RAG + 1-hop neighbors (slash-safe) |
+| GET | `/api/top-debt?k=10` | Top-k DIV functions (with graph `id`) |
+| GET | `/api/function/context?file_path=...&name=...` | RAG + 1-hop neighbours + `impact` + `rule_based` suggestions |
 | GET | `/api/function/{file_path}/{name}/context` | Same, path-param form (`file_path` URL-encoded) |
-| POST | `/api/refactor-proposals` | `{ "top_k": 1 }` → `{ job_id }` (background LLM) |
-| GET | `/api/refactor-proposals/{job_id}` | Poll job status / results |
+| POST | `/api/refactor-proposals` | `{ "file_path", "name", "force"? }` → `{ job_id, cached }` (or `{ "top_k": n }`) |
+| GET | `/api/refactor-proposals/{job_id}` | Poll status, `stage` / `stages_seen`, and results |
+
+Refactor proposals: the model loads **once** in a background thread at API startup and is shared by all
+jobs. Model output must contain code (or a concrete change) for the target function; README-style or
+unrelated text is rejected and retried once with a stricter code-completion prompt. If both attempts fail
+the result is `source: "rule_based"` and the UI shows the deterministic suggestions from
+`src/agent/rules.py` instead. Completed proposals are cached per function until `force: true`.
 
 ### Frontend (Vite + React + D3)
 
