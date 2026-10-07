@@ -43,6 +43,9 @@ class RefactorRequest(BaseModel):
     """Body for ``POST /api/refactor-proposals``."""
 
     top_k: int = Field(default=3, ge=1, le=20)
+    # Optional single-function target; when both are set, ``top_k`` is ignored.
+    file_path: Optional[str] = None
+    name: Optional[str] = None
 
 
 def _utc_now() -> str:
@@ -255,7 +258,10 @@ def debt_graph() -> dict[str, Any]:
 def top_debt(k: int = Query(default=10, ge=1, le=100)) -> dict[str, Any]:
     """Return the top-``k`` functions by DIV score."""
     driver = _require_driver()
-    nodes = get_top_debt_nodes(driver, k=k)
+    nodes = [
+        {"id": _node_id(n["file_path"], n["name"]), **n}
+        for n in get_top_debt_nodes(driver, k=k)
+    ]
     return {"k": k, "nodes": nodes}
 
 
@@ -289,13 +295,33 @@ def function_context_query(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _run_refactor_job(job_id: str, top_k: int) -> None:
+def _fetch_debt_node(driver: Driver, file_path: str, name: str) -> Optional[dict[str, Any]]:
+    """Return DIV metrics for one ``:Function`` node, or ``None`` if absent."""
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (f:Function {file_path: $file_path, name: $name})
+            RETURN f.file_path AS file_path,
+                   f.name AS name,
+                   coalesce(f.div_score, 0.0) AS div_score,
+                   coalesce(f.cyclomatic_complexity, 0) AS cyclomatic_complexity,
+                   coalesce(f.change_frequency, 0) AS change_frequency
+            LIMIT 1
+            """,
+            {"file_path": file_path, "name": name},
+        ).single()
+    return dict(record) if record else None
+
+
+def _run_refactor_job(
+    job_id: str, top_k: int, nodes: Optional[list[dict[str, Any]]] = None
+) -> None:
     """Background worker: generate proposals and update job status."""
     with _jobs_lock:
         _jobs[job_id]["status"] = "running"
         _jobs[job_id]["started_at"] = _utc_now()
     try:
-        proposals = generate_refactor_proposals(top_k=top_k)
+        proposals = generate_refactor_proposals(top_k=top_k, nodes=nodes)
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
             _jobs[job_id]["finished_at"] = _utc_now()
@@ -313,7 +339,20 @@ def start_refactor_proposals(
     body: RefactorRequest,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
-    """Enqueue a StarCoder2 refactor job; poll with GET ``/api/refactor-proposals/{job_id}``."""
+    """Enqueue a StarCoder2 refactor job; poll with GET ``/api/refactor-proposals/{job_id}``.
+
+    Targets the top-``k`` DIV functions, or a single function when ``file_path``
+    and ``name`` are both given.
+    """
+    nodes: Optional[list[dict[str, Any]]] = None
+    if body.file_path and body.name:
+        node = _fetch_debt_node(_require_driver(), body.file_path.replace("\\", "/"), body.name)
+        if node is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown function: {body.file_path}::{body.name}",
+            )
+        nodes = [node]
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {
@@ -326,7 +365,7 @@ def start_refactor_proposals(
             "result": None,
             "error": None,
         }
-    background_tasks.add_task(_run_refactor_job, job_id, body.top_k)
+    background_tasks.add_task(_run_refactor_job, job_id, body.top_k, nodes)
     return {"job_id": job_id, "status": "queued", "top_k": body.top_k}
 
 

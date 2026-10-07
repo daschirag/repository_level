@@ -1,299 +1,205 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import {
   fetchDebtGraph,
-  fetchFunctionContext,
+  fetchHealth,
   fetchTopDebt,
-  startRefactorJob,
-  fetchRefactorJob,
-  type DebtEdge,
-  type DebtNode,
+  type CallNeighbor,
   type DebtGraphResponse,
-  type FunctionContext,
+  type DebtNode,
+  type HealthResponse,
+  type TopDebtNode,
 } from "./api";
-import { DebtGraphView } from "./DebtGraphView";
+import { GraphView } from "./components/GraphView";
+import { Header } from "./components/Header";
+import { NodeDrawer } from "./components/NodeDrawer";
+import { StatCards, type Stats } from "./components/StatCards";
+import { TopDebtList } from "./components/TopDebtList";
+import { EmptyState, ErrorBanner, Skeleton } from "./components/ui";
+import { makeDivColor, makeDivRadius } from "./lib/scales";
+import { useRefactorJobs } from "./lib/useRefactorJobs";
 
-type ViewMode = "graph" | "table";
+const TOP_K = 15;
+
+type LoadState =
+  | { status: "loading" }
+  | { status: "ready"; graph: DebtGraphResponse; top: TopDebtNode[] }
+  | { status: "error"; message: string };
 
 export default function App() {
-  const [view, setView] = useState<ViewMode>("graph");
-  const [graph, setGraph] = useState<DebtGraphResponse | null>(null);
-  const [topNodes, setTopNodes] = useState<DebtNode[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [selected, setSelected] = useState<DebtNode | null>(null);
-  const [context, setContext] = useState<FunctionContext | null>(null);
-  const [contextLoading, setContextLoading] = useState(false);
-  const [topN, setTopN] = useState(80);
-  const [callsOnly, setCallsOnly] = useState(true);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [jobStatus, setJobStatus] = useState<string | null>(null);
-  const [proposals, setProposals] = useState<unknown[] | null>(null);
+  const [load, setLoad] = useState<LoadState>({ status: "loading" });
+  const [health, setHealth] = useState<HealthResponse | null | "error">(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const { jobs, start } = useRefactorJobs();
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const [g, top] = await Promise.all([fetchDebtGraph(), fetchTopDebt(15)]);
+    setLoad((prev) => (prev.status === "ready" ? prev : { status: "loading" }));
+    fetchHealth()
+      .then((h) => !cancelled && setHealth(h))
+      .catch(() => !cancelled && setHealth("error"));
+    Promise.all([fetchDebtGraph(), fetchTopDebt(TOP_K)])
+      .then(([graph, top]) => !cancelled && setLoad({ status: "ready", graph, top: top.nodes }))
+      .catch((err) => {
         if (cancelled) return;
-        setGraph(g);
-        setTopNodes(top.nodes);
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+        const raw = err instanceof Error ? err.message : String(err);
+        const message = /Failed to fetch|NetworkError|ECONNREFUSED|^50[234]/.test(raw)
+          ? "The API at /api is unreachable. Start it with `uvicorn src.serving.api.main:app --port 8000` and make sure Neo4j is running."
+          : raw;
+        setLoad({ status: "error", message });
+      });
     return () => {
       cancelled = true;
     };
+  }, [attempt]);
+
+  const retry = useCallback(() => {
+    setLoad({ status: "loading" });
+    setAttempt((a) => a + 1);
   }, []);
 
-  const visible = useMemo(() => {
-    if (!graph) return { nodes: [] as DebtNode[], edges: [] as DebtEdge[] };
-    const functions = graph.nodes
-      .filter((n) => (n.node_kind ?? "Function") === "Function")
-      .slice()
-      .sort((a, b) => (b.div_score || 0) - (a.div_score || 0));
-    const keep = new Set(functions.slice(0, topN).map((n) => n.id));
-    const nodes = graph.nodes.filter((n) => keep.has(n.id));
-    const edges = graph.edges.filter((e) => {
-      if (callsOnly && e.type !== "CALLS") return false;
-      return keep.has(String(e.source)) && keep.has(String(e.target));
-    });
-    return { nodes, edges };
-  }, [graph, topN, callsOnly]);
+  const graph = load.status === "ready" ? load.graph : null;
 
-  const onSelect = useCallback((node: DebtNode) => {
-    setSelected(node);
-    setContext(null);
-  }, []);
+  const functions = useMemo(
+    () => (graph ? graph.nodes.filter((n) => (n.node_kind ?? "Function") === "Function") : []),
+    [graph],
+  );
+  const callEdges = useMemo(() => (graph ? graph.edges.filter((e) => e.type === "CALLS") : []), [graph]);
+  const nodeById = useMemo(() => new Map(functions.map((n) => [n.id, n])), [functions]);
 
-  const loadContext = async () => {
+  const stats = useMemo<Stats | null>(() => {
+    if (!graph) return null;
+    let max: DebtNode | null = null;
+    let sum = 0;
+    for (const n of functions) {
+      sum += n.div_score || 0;
+      if (!max || n.div_score > max.div_score) max = n;
+    }
+    return {
+      nodeCount: graph.node_count,
+      edgeCount: graph.edge_count,
+      functionCount: functions.length,
+      callCount: callEdges.length,
+      importCount: graph.edges.length - callEdges.length,
+      maxDiv: max?.div_score ?? 0,
+      maxDivName: max ? max.name : null,
+      avgDiv: functions.length ? sum / functions.length : 0,
+    };
+  }, [graph, functions, callEdges]);
+
+  const maxDiv = stats?.maxDiv ?? 0;
+  const colorOf = useMemo(() => makeDivColor(maxDiv), [maxDiv]);
+  const radiusOf = useMemo(() => makeDivRadius(maxDiv), [maxDiv]);
+
+  const selected = selectedId ? nodeById.get(selectedId) ?? null : null;
+  const close = useCallback(() => setSelectedId(null), []);
+
+  useEffect(() => {
     if (!selected) return;
-    setContextLoading(true);
-    setError(null);
-    try {
-      const ctx = await fetchFunctionContext(selected.file_path, selected.name);
-      setContext(ctx);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setContextLoading(false);
-    }
-  };
-
-  const enqueueRefactor = async () => {
-    setError(null);
-    setProposals(null);
-    try {
-      const { job_id } = await startRefactorJob(1);
-      setJobId(job_id);
-      setJobStatus("queued");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  useEffect(() => {
-    if (!jobId) return;
-    let cancelled = false;
-    const timer = setInterval(async () => {
-      try {
-        const job = await fetchRefactorJob(jobId);
-        if (cancelled) return;
-        const status = String(job.status ?? "");
-        setJobStatus(status);
-        if (status === "completed") {
-          const result = job.result as { proposals?: unknown[] } | undefined;
-          setProposals(result?.proposals ?? []);
-          clearInterval(timer);
-        } else if (status === "failed") {
-          setError(String(job.error ?? "Refactor job failed"));
-          clearInterval(timer);
-        }
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-        clearInterval(timer);
-      }
-    }, 2500);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
     };
-  }, [jobId]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, close]);
+
+  const selectNode = useCallback((n: { id: string }) => setSelectedId(n.id), []);
+  const navigate = useCallback(
+    (n: CallNeighbor) => {
+      const id = `${n.file_path}::${n.name}`;
+      if (nodeById.has(id)) setSelectedId(id);
+    },
+    [nodeById],
+  );
+
+  const qdrantOnline = health && health !== "error" ? health.qdrant : health === "error" ? false : null;
+  const isEmpty = load.status === "ready" && functions.length === 0;
 
   return (
-    <div className="app">
-      <header className="header">
-        <div>
-          <h1>Tech Debt Heatmap</h1>
-          <p className="muted">
-            DIV-ranked call graph — green = low debt, red = high debt
-          </p>
-        </div>
-        <div className="header-actions">
-          <button
-            className={view === "graph" ? "active" : ""}
-            onClick={() => setView("graph")}
-            type="button"
-          >
-            Graph
-          </button>
-          <button
-            className={view === "table" ? "active" : ""}
-            onClick={() => setView("table")}
-            type="button"
-          >
-            Top debt
-          </button>
-        </div>
-      </header>
+    <MotionConfig reducedMotion="user">
+      <div className={`app ${selected ? "has-drawer" : ""}`}>
+        <Header health={health} />
 
-      {error && <div className="banner error">{error}</div>}
-      {loading && <div className="banner">Loading debt graph…</div>}
+        <main className="content">
+          <AnimatePresence>
+            {load.status === "error" && (
+              <ErrorBanner title="Couldn’t load debt data" message={load.message} onRetry={retry} />
+            )}
+          </AnimatePresence>
 
-      <div className="layout">
-        <main className="main">
-          {view === "graph" && graph && (
-            <>
-              <div className="toolbar">
-                <label>
-                  Top N functions
-                  <input
-                    type="number"
-                    min={10}
-                    max={500}
-                    value={topN}
-                    onChange={(e) => setTopN(Number(e.target.value) || 80)}
-                  />
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={callsOnly}
-                    onChange={(e) => setCallsOnly(e.target.checked)}
-                  />
-                  CALLS edges only
-                </label>
-                <span className="muted">
-                  showing {visible.nodes.length} / {graph.node_count} nodes,{" "}
-                  {visible.edges.length} edges
-                </span>
+          <StatCards stats={stats} />
+
+          <motion.div
+            className="workspace"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.15, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <section className="card panel panel--graph" aria-label="Call graph">
+              <div className="panel__head">
+                <h2>Call-graph heat-map</h2>
+                <span className="muted small">Hover to trace callers/callees · drag · scroll to zoom</span>
               </div>
-              <DebtGraphView
-                nodes={visible.nodes}
-                edges={visible.edges}
-                selectedId={selected?.id ?? null}
-                onSelect={onSelect}
-              />
-            </>
-          )}
+              {load.status !== "ready" && (
+                <div className="graph-skeleton" aria-busy={load.status === "loading"}>
+                  <Skeleton height="100%" radius={14} />
+                  {load.status === "error" && <span className="graph-skeleton__msg">No data — backend unreachable</span>}
+                </div>
+              )}
+              {isEmpty && (
+                <EmptyState title="No functions in the graph yet">
+                  <p>Ingest a repository, then compute DIV scores:</p>
+                  <pre className="code">
+                    <code>
+                      python -m src.graph.neo4j_client path/to/repo{"\n"}python -m src.scoring.div_propagation
+                    </code>
+                  </pre>
+                  <button type="button" className="btn btn--ghost" onClick={retry}>
+                    Reload
+                  </button>
+                </EmptyState>
+              )}
+              {load.status === "ready" && !isEmpty && (
+                <GraphView
+                  nodes={functions}
+                  edges={callEdges}
+                  maxDiv={maxDiv}
+                  colorOf={colorOf}
+                  radiusOf={radiusOf}
+                  selectedId={selectedId}
+                  onSelect={selectNode}
+                />
+              )}
+            </section>
 
-          {view === "table" && (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>name</th>
-                    <th>file</th>
-                    <th>DIV</th>
-                    <th>cc</th>
-                    <th>chg</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {topNodes.map((n, i) => (
-                    <tr
-                      key={`${n.file_path}::${n.name}`}
-                      className={
-                        selected?.file_path === n.file_path && selected?.name === n.name
-                          ? "selected"
-                          : ""
-                      }
-                      onClick={() =>
-                        onSelect({
-                          ...n,
-                          id: `${n.file_path}::${n.name}`,
-                          node_kind: "Function",
-                        })
-                      }
-                    >
-                      <td>{i + 1}</td>
-                      <td>{n.name}</td>
-                      <td className="path">{n.file_path}</td>
-                      <td>{Number(n.div_score).toFixed(2)}</td>
-                      <td>{n.cyclomatic_complexity}</td>
-                      <td>{n.change_frequency}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+            <aside className="card panel panel--list" aria-label="Top debt nodes">
+              <TopDebtList
+                nodes={load.status === "ready" ? load.top : load.status === "error" ? [] : null}
+                maxDiv={maxDiv}
+                colorOf={colorOf}
+                selectedId={selectedId}
+                onSelect={selectNode}
+              />
+            </aside>
+          </motion.div>
         </main>
 
-        <aside className="side">
-          <h2>Node details</h2>
-          {!selected && <p className="muted">Click a node or table row.</p>}
+        <AnimatePresence>
           {selected && (
-            <div className="details">
-              <div className="kv">
-                <span>Name</span>
-                <strong>{selected.name}</strong>
-              </div>
-              <div className="kv">
-                <span>File</span>
-                <strong className="path">{selected.file_path}</strong>
-              </div>
-              <div className="kv">
-                <span>DIV</span>
-                <strong>{Number(selected.div_score).toFixed(3)}</strong>
-              </div>
-              <div className="kv">
-                <span>Complexity</span>
-                <strong>{selected.cyclomatic_complexity}</strong>
-              </div>
-              <div className="kv">
-                <span>Change freq</span>
-                <strong>{selected.change_frequency}</strong>
-              </div>
-              <button type="button" onClick={loadContext} disabled={contextLoading}>
-                {contextLoading ? "Loading context…" : "Fetch RAG + graph context"}
-              </button>
-              <button type="button" className="secondary" onClick={enqueueRefactor}>
-                Queue refactor proposal (top_k=1)
-              </button>
-              {jobId && (
-                <p className="muted">
-                  Job {jobId.slice(0, 8)}… — {jobStatus}
-                </p>
-              )}
-            </div>
+            <NodeDrawer
+              node={selected}
+              maxDiv={maxDiv}
+              colorOf={colorOf}
+              qdrantOnline={qdrantOnline}
+              proposal={jobs[selected.id]}
+              onGenerate={() => start(selected)}
+              onNavigate={navigate}
+              onClose={close}
+            />
           )}
-
-          {context && (
-            <div className="context">
-              <h3>Context</h3>
-              <p className="muted">
-                Callers: {context.callers?.length ?? 0} · Callees:{" "}
-                {context.callees?.length ?? 0} · Neighbors:{" "}
-                {context.semantic_neighbors?.length ?? 0}
-              </p>
-              <pre>{JSON.stringify(context, null, 2)}</pre>
-            </div>
-          )}
-
-          {proposals && (
-            <div className="context">
-              <h3>Refactor proposals</h3>
-              <pre>{JSON.stringify(proposals, null, 2)}</pre>
-            </div>
-          )}
-        </aside>
+        </AnimatePresence>
       </div>
-    </div>
+    </MotionConfig>
   );
 }

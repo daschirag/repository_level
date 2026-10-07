@@ -435,12 +435,15 @@ def build_refactor_graph(llm: Optional[LLMClient] = None) -> Any:
 def generate_refactor_proposals(
     top_k: int = 5,
     llm: Optional[LLMClient] = None,
+    nodes: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict]:
     """Generate refactor proposals for the top-``k`` DIV debt nodes.
 
     Args:
         top_k: How many highest-DIV functions to propose refactors for.
         llm: Optional shared LLM client (avoids reloading a multi-GB GGUF).
+        nodes: Explicit debt nodes to target instead of the top-``k`` ranking
+            (same keys as :func:`fetch_top_debt_nodes` rows).
 
     Returns:
         List of dicts with keys:
@@ -449,7 +452,7 @@ def generate_refactor_proposals(
     """
     client = llm or get_llm_client()
     app = build_refactor_graph(client)
-    debt_nodes = fetch_top_debt_nodes(k=top_k)
+    debt_nodes = nodes if nodes is not None else fetch_top_debt_nodes(k=top_k)
     proposals: list[dict[str, Any]] = []
 
     for node in debt_nodes:
