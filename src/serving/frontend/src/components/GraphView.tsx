@@ -297,7 +297,7 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       if (!simNodes.length) return;
       const xs = simNodes.map((n) => n.x ?? 0);
       const ys = simNodes.map((n) => n.y ?? 0);
-      const pad = 48;
+      const pad = 72; // room for labels around the outermost nodes
       const x0 = Math.min(...xs) - pad;
       const x1 = Math.max(...xs) + pad;
       const y0 = Math.min(...ys) - pad;
@@ -417,7 +417,15 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
       svg.attr("viewBox", `0 0 ${width} ${height}`);
       sim.force("x", d3.forceX<SimNode>(width / 2).strength(0.06));
       sim.force("y", d3.forceY<SimNode>(height / 2).strength(0.06));
-      if (!reduceMotion) sim.alpha(0.2).restart();
+      // Re-fit once the layout re-settles in the new size (e.g. drawer opened).
+      if (reduceMotion) {
+        for (let i = 0; i < 120; i += 1) sim.tick();
+        ticked();
+        fit(false);
+      } else {
+        fitted = false;
+        sim.alpha(0.3).restart();
+      }
     });
     resize.observe(container);
 
@@ -613,7 +621,10 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
           )}
         </AnimatePresence>
 
-        <div className="legend card" aria-label="Legend">
+      </div>
+
+      <div className="legend" aria-label="Legend">
+        <div className="legend__scale">
           <span className="legend__title">DIV score</span>
           <div
             className="legend__bar"
@@ -625,38 +636,38 @@ export function GraphView({ nodes, edges, maxDiv, colorOf, radiusOf, selectedId,
             <span>{formatDiv(maxDiv / 4)}</span>
             <span>{formatDiv(maxDiv)}</span>
           </div>
-          <ul className="legend__notes">
-            <li>
-              <span className="legend__sizes" aria-hidden="true">
-                <i />
-                <i />
-                <i />
-              </span>
-              Size ∝ DIV
-            </li>
-            <li>
-              <span className="legend__glow" aria-hidden="true" />
-              Glow = hotspot
-            </li>
-            <li>
-              <span className="legend__arrow" aria-hidden="true" />
-              Caller → callee
-            </li>
-            <li>
-              <span className="legend__line" style={{ background: "var(--callee)" }} aria-hidden="true" />
-              Callees on hover
-            </li>
-            <li>
-              <span className="legend__line" style={{ background: "var(--caller)" }} aria-hidden="true" />
-              Callers on hover
-            </li>
-          </ul>
-          {maxDiv === 0 && (
-            <p className="legend__warn">
-              Every DIV score is 0 — churn needs git history. Re-ingest a repository with commits.
-            </p>
-          )}
         </div>
+        <ul className="legend__notes">
+          <li>
+            <span className="legend__sizes" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+            Size ∝ DIV
+          </li>
+          <li>
+            <span className="legend__glow" aria-hidden="true" />
+            Glow = hotspot
+          </li>
+          <li>
+            <span className="legend__arrow" aria-hidden="true" />
+            Caller → callee
+          </li>
+          <li>
+            <span className="legend__line" style={{ background: "var(--callee)" }} aria-hidden="true" />
+            Callees on hover
+          </li>
+          <li>
+            <span className="legend__line" style={{ background: "var(--caller)" }} aria-hidden="true" />
+            Callers on hover
+          </li>
+        </ul>
+        {maxDiv === 0 && (
+          <p className="legend__warn">
+            Every DIV score is 0 — churn needs git history. Re-ingest a repository with commits.
+          </p>
+        )}
       </div>
     </div>
   );

@@ -974,18 +974,27 @@ select {
 }
 
 .legend {
-  position: absolute;
-  left: var(--s-3);
-  bottom: var(--s-3);
-  width: 210px;
-  padding: var(--s-3);
-  background: var(--surface-strong);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2) var(--s-5);
+  padding: var(--s-1) var(--s-1) 0;
   font-size: 11.5px;
+}
+
+.legend__scale {
+  display: grid;
+  grid-template-columns: auto 160px;
+  align-items: center;
+  column-gap: var(--s-3);
+}
+
+.legend__scale .legend__ticks {
+  grid-column: 2;
 }
 
 .legend__title {
   display: block;
-  margin-bottom: 6px;
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
@@ -1007,11 +1016,11 @@ select {
 }
 
 .legend__notes {
-  display: grid;
-  gap: 5px;
-  margin: var(--s-2) 0 0;
-  padding: var(--s-2) 0 0;
-  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-4);
+  margin: 0;
+  padding: 0;
   list-style: none;
   color: var(--text-muted);
 }
@@ -1080,7 +1089,8 @@ select {
 }
 
 .legend__warn {
-  margin: var(--s-2) 0 0;
+  flex-basis: 100%;
+  margin: 0;
   padding: 6px 8px;
   border-radius: 6px;
   color: #fde68a;
@@ -1454,15 +1464,15 @@ select {
    Responsive
    ========================================================================== */
 @media (min-width: 1280px) {
-  /* Keep the ranked list visible beside the open drawer on wide screens. */
+  /* Push content left so the graph and ranked list stay usable beside the drawer. */
   .app.has-drawer .content {
     padding-right: calc(var(--drawer-width) + var(--s-4));
   }
   .app.has-drawer .workspace {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) 300px;
   }
-  .app.has-drawer .panel--list {
-    display: none;
+  .app.has-drawer .header {
+    padding-right: calc(var(--drawer-width) + var(--s-5));
   }
 }
 
@@ -1490,9 +1500,6 @@ select {
   }
   .content {
     padding: var(--s-4);
-  }
-  .legend {
-    width: 180px;
   }
 }
 
