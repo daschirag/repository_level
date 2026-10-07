@@ -10,10 +10,12 @@ Repo-level technical debt quantification and refactor proposal system (Layers 1â
 - Node.js 18+ and npm (frontend only)
 - StarCoder2 GGUF at `models/starcoder2/starcoder2-7b-Q4_K_M.gguf` (optional; agent falls back to mock LLM)
 
-### Start Qdrant (if not running)
+### Start Neo4j + Qdrant
+
+From the project root (uses `docker-compose.yml`; waits until both report healthy):
 
 ```bash
-docker run -d -p 6333:6333 -p 6334:6334 --name techdebt-qdrant -v D:\techdebt-agent\data\qdrant:/qdrant/storage qdrant/qdrant
+docker compose up -d --wait
 ```
 
 ## Layer 6 â€” API + heatmap UI

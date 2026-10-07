@@ -5,6 +5,7 @@ import {
   fetchTopDebt,
   startRefactorJob,
   fetchRefactorJob,
+  type DebtEdge,
   type DebtNode,
   type DebtGraphResponse,
   type FunctionContext,
@@ -50,7 +51,7 @@ export default function App() {
   }, []);
 
   const visible = useMemo(() => {
-    if (!graph) return { nodes: [] as DebtNode[], edges: graph?.edges ?? [] };
+    if (!graph) return { nodes: [] as DebtNode[], edges: [] as DebtEdge[] };
     const functions = graph.nodes
       .filter((n) => (n.node_kind ?? "Function") === "Function")
       .slice()

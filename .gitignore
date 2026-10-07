@@ -14,3 +14,7 @@ data/
 models/
 *.db
 *.arrow
+
+# frontend build output
+*.tsbuildinfo
+src/serving/frontend/dist/

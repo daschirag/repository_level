@@ -35,3 +35,8 @@ torch = { index = "pytorch-cu121" }
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/fixtures holds third-party sample repos used as ingestion input, not our tests.
+norecursedirs = ["tests/fixtures", ".*", "node_modules", "data", "demo"]
