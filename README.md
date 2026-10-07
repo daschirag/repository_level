@@ -107,3 +107,7 @@ python -m src.rag.qdrant_client path\to\repo
 # Layer 5 — refactor proposals (uses StarCoder2 GGUF if present)
 python -m src.agent.refactor_agent 1
 ```
+
+## Project Status (Review 1)
+Phases 1-4 implemented: ingestion, call graph, DIV propagation, RAG + agent, plus the dashboard. Evaluation and ablation study are pending.
+
